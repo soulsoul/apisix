@@ -21,7 +21,8 @@ local ipairs      = ipairs
 local ngx         = ngx
 local type        = type
 local re_sub      = ngx.re.sub
-
+local sub_str     = string.sub
+local str_find    = core.string.find
 
 local schema = {
     type = "object",
@@ -47,7 +48,7 @@ local schema = {
         host = {
             description = "new host for upstream",
             type        = "string",
-            pattern     = "^[0-9a-zA-Z-.]+$",
+            pattern     = [[^[0-9a-zA-Z-.]+(:\d{1,5})?$]],
         },
         scheme = {
             description = "new scheme for upstream",
@@ -61,6 +62,7 @@ local schema = {
         },
     },
     minProperties = 1,
+    additionalProperties = false,
 }
 
 
@@ -87,39 +89,41 @@ function _M.check_schema(conf)
         end
     end
 
-    --reform header from object into array, so can avoid use pairs, which is NYI
-    if conf.headers then
-        conf.headers_arr = {}
+    -- check headers
+    if not conf.headers then
+        return true
+    end
 
-        for field, value in pairs(conf.headers) do
-            if type(field) == 'string'
-                and (type(value) == 'string' or type(value) == 'number') then
-                if #field == 0 then
-                    return false, 'invalid field length in header'
-                end
+    for field, value in pairs(conf.headers) do
+        if type(field) ~= 'string' then
+            return false, 'invalid type as header field'
+        end
 
-                core.log.info("header field: ", field)
+        if type(value) ~= 'string' and type(value) ~= 'number' then
+            return false, 'invalid type as header value'
+        end
 
-                if not core.utils.validate_header_field(field) then
-                    return false, 'invalid field character in header'
-                end
-                if not core.utils.validate_header_value(value) then
-                    return false, 'invalid value character in header'
-                end
-                core.table.insert(conf.headers_arr, field)
-                core.table.insert(conf.headers_arr, value)
-            else
-                return false, 'invalid type as header value'
-            end
+        if #field == 0 then
+            return false, 'invalid field length in header'
+        end
+
+        core.log.info("header field: ", field)
+
+        if not core.utils.validate_header_field(field) then
+            return false, 'invalid field character in header'
+        end
+
+        if not core.utils.validate_header_value(value) then
+            return false, 'invalid value character in header'
         end
     end
+
     return true
 end
 
 
 do
     local upstream_vars = {
-        scheme     = "upstream_scheme",
         host       = "upstream_host",
         upgrade    = "upstream_upgrade",
         connection = "upstream_connection",
@@ -135,10 +139,13 @@ function _M.rewrite(conf, ctx)
             ctx.var[upstream_vars[name]] = conf[name]
         end
     end
+    if conf["scheme"] then
+        ctx.upstream_scheme = conf["scheme"]
+    end
 
     local upstream_uri = ctx.var.uri
     if conf.uri ~= nil then
-        upstream_uri = conf.uri
+        upstream_uri = core.utils.resolve_var(conf.uri, ctx.var)
     elseif conf.regex_uri ~= nil then
         local uri, _, err = re_sub(ctx.var.uri, conf.regex_uri[1],
                                    conf.regex_uri[2], "jo")
@@ -153,19 +160,42 @@ function _M.rewrite(conf, ctx)
         end
     end
 
-    upstream_uri = core.utils.uri_safe_encode(upstream_uri)
+    local index = str_find(upstream_uri, "?")
+    if index then
+        upstream_uri = core.utils.uri_safe_encode(sub_str(upstream_uri, 1, index-1)) ..
+                       sub_str(upstream_uri, index)
+    else
+        upstream_uri = core.utils.uri_safe_encode(upstream_uri)
+    end
 
     if ctx.var.is_args == "?" then
-        ctx.var.upstream_uri = upstream_uri .. "?" .. (ctx.var.args or "")
+        if index then
+            ctx.var.upstream_uri = upstream_uri .. "&" .. (ctx.var.args or "")
+        else
+            ctx.var.upstream_uri = upstream_uri .. "?" .. (ctx.var.args or "")
+        end
     else
         ctx.var.upstream_uri = upstream_uri
     end
 
-    if conf.headers_arr then
-        local field_cnt = #conf.headers_arr
-        for i = 1, field_cnt, 2 do
-            ngx.req.set_header(conf.headers_arr[i], conf.headers_arr[i+1])
+    if not conf.headers then
+        return
+    end
+
+    -- reform header from object into array, so can avoid use pairs,
+    -- which is NYI
+    if not conf.headers_arr then
+        conf.headers_arr = {}
+
+        for field, value in pairs(conf.headers) do
+            core.table.insert_tail(conf.headers_arr, field, value)
         end
+    end
+
+    local field_cnt = #conf.headers_arr
+    for i = 1, field_cnt, 2 do
+        ngx.req.set_header(conf.headers_arr[i],
+                           core.utils.resolve_var(conf.headers_arr[i+1], ctx.var))
     end
 end
 

@@ -14,17 +14,34 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 --
-local core    = require("apisix.core")
-local http    = require("resty.http")
-local ngx     = ngx
-local io_open = io.open
-local ipairs  = ipairs
-local pairs   = pairs
+local core      = require("apisix.core")
+local http      = require("resty.http")
+local plugin    = require("apisix.plugin")
+local ngx       = ngx
+local ipairs    = ipairs
+local pairs     = pairs
+local str_find  = core.string.find
+local str_lower = string.lower
+
 
 local plugin_name = "batch-requests"
 
 local schema = {
     type = "object",
+    additionalProperties = false,
+}
+
+local default_max_body_size = 1024 * 1024 -- 1MiB
+local metadata_schema = {
+    type = "object",
+    properties = {
+        max_body_size = {
+            description = "max pipeline body size in bytes",
+            type = "integer",
+            exclusiveMinimum = 0,
+            default = default_max_body_size,
+        },
+    },
     additionalProperties = false,
 }
 
@@ -92,7 +109,8 @@ local _M = {
     version = 0.1,
     priority = 4010,
     name = plugin_name,
-    schema = schema
+    schema = schema,
+    metadata_schema = metadata_schema,
 }
 
 
@@ -112,18 +130,42 @@ local function check_input(data)
     end
 end
 
-
-local function set_common_header(data)
-    if not data.headers then
-        return
+local function lowercase_key_or_init(obj)
+    if not obj then
+        return {}
     end
 
+    local lowercase_key_obj = {}
+    for k, v in pairs(obj) do
+        lowercase_key_obj[str_lower(k)] = v
+    end
+
+    return lowercase_key_obj
+end
+
+local function ensure_header_lowercase(data)
+    data.headers = lowercase_key_or_init(data.headers)
+
     for i,req in ipairs(data.pipeline) do
-        if not req.headers then
-            req.headers = data.headers
-        else
-            for k, v in pairs(data.headers) do
-                if not req.headers[k] then
+        req.headers = lowercase_key_or_init(req.headers)
+    end
+end
+
+
+local function set_common_header(data)
+    local outer_headers = core.request.headers(nil)
+    for i,req in ipairs(data.pipeline) do
+        for k, v in pairs(data.headers) do
+            if not req.headers[k] then
+                req.headers[k] = v
+            end
+        end
+
+        if outer_headers then
+            for k, v in pairs(outer_headers) do
+                local is_content_header = str_find(k, "content-") == 1
+                -- skip header start with "content-"
+                if not req.headers[k] and not is_content_header then
                     req.headers[k] = v
                 end
             end
@@ -151,58 +193,55 @@ local function set_common_query(data)
 end
 
 
-local function get_file(file_name)
-    local f = io_open(file_name, 'r')
-    if f then
-        local req_body = f:read("*all")
-        f:close()
-        return req_body
+local function batch_requests(ctx)
+    local metadata = plugin.plugin_metadata(plugin_name)
+    core.log.info("metadata: ", core.json.delay_encode(metadata))
+
+    local max_body_size
+    if metadata then
+        max_body_size = metadata.value.max_body_size
+    else
+        max_body_size = default_max_body_size
     end
 
-    return
-end
-
-
-local function batch_requests()
-    ngx.req.read_body()
-    local req_body = ngx.req.get_body_data()
+    local req_body, err = core.request.get_body(max_body_size, ctx)
+    if err then
+        -- Nginx doesn't support 417: https://trac.nginx.org/nginx/ticket/2062
+        -- So always return 413 instead
+        return 413, { error_msg = err }
+    end
     if not req_body then
-        local file_name = ngx.req.get_body_file()
-        if file_name then
-            req_body = get_file(file_name)
-        end
-
-        if not req_body then
-            core.response.exit(400, {
-                error_msg = "no request body, you should give at least one pipeline setting"
-            })
-        end
+        return 400, {
+            error_msg = "no request body, you should give at least one pipeline setting"
+        }
     end
 
     local data, err = core.json.decode(req_body)
     if not data then
-        core.response.exit(400, {
+        return 400, {
             error_msg = "invalid request body: " .. req_body .. ", err: " .. err
-        })
+        }
     end
 
     local code, body = check_input(data)
     if code then
-        core.response.exit(code, body)
+        return code, body
     end
 
     local httpc = http.new()
     httpc:set_timeout(data.timeout)
     local ok, err = httpc:connect("127.0.0.1", ngx.var.server_port)
     if not ok then
-        core.response.exit(500, {error_msg = "connect to apisix failed: " .. err})
+        return 500, {error_msg = "connect to apisix failed: " .. err}
     end
 
+    ensure_header_lowercase(data)
     set_common_header(data)
     set_common_query(data)
+
     local responses, err = httpc:request_pipeline(data.pipeline)
     if not responses then
-        core.response.exit(400, {error_msg = "request failed: " .. err})
+        return 400, {error_msg = "request failed: " .. err}
     end
 
     local aggregated_resp = {}
@@ -223,7 +262,7 @@ local function batch_requests()
         end
         core.table.insert(aggregated_resp, sub_resp)
     end
-    core.response.exit(200, aggregated_resp)
+    return 200, aggregated_resp
 end
 
 

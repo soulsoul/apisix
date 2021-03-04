@@ -297,3 +297,242 @@ GET /t
 [delete] code: 200 message: passed
 --- no_error_log
 [error]
+
+
+
+=== TEST 8: string id
+--- config
+    location /t {
+        content_by_lua_block {
+            local t = require("lib.test_admin").test
+            local code, body = t('/apisix/admin/stream_routes/a-b-c-ABC_0123',
+                ngx.HTTP_PUT,
+                [[{
+                    "remote_addr": "127.0.0.1",
+                    "upstream": {
+                        "nodes": {
+                            "127.0.0.1:8080": 1
+                        },
+                        "type": "roundrobin"
+                    }
+                }]]
+            )
+            if code >= 300 then
+                ngx.status = code
+            end
+            ngx.say(body)
+        }
+    }
+--- request
+GET /t
+--- response_body
+passed
+--- no_error_log
+[error]
+
+
+
+=== TEST 9: string id(delete)
+--- config
+    location /t {
+        content_by_lua_block {
+            local t = require("lib.test_admin").test
+            local code, body = t('/apisix/admin/stream_routes/a-b-c-ABC_0123',
+                ngx.HTTP_DELETE
+            )
+            if code >= 300 then
+                ngx.status = code
+            end
+            ngx.say(body)
+        }
+    }
+--- request
+GET /t
+--- response_body
+passed
+--- no_error_log
+[error]
+
+
+
+=== TEST 10: invalid string id
+--- config
+    location /t {
+        content_by_lua_block {
+            local t = require("lib.test_admin").test
+            local code, body = t('/apisix/admin/stream_routes/*invalid',
+                ngx.HTTP_PUT,
+                [[{
+                    "remote_addr": "127.0.0.1",
+                    "upstream": {
+                        "nodes": {
+                            "127.0.0.1:8080": 1
+                        },
+                        "type": "roundrobin"
+                    }
+                }]]
+            )
+            if code >= 300 then
+                ngx.status = code
+            end
+            ngx.say(body)
+        }
+    }
+--- request
+GET /t
+--- error_code: 400
+--- no_error_log
+[error]
+
+
+
+=== TEST 11: not unwanted data, POST
+--- config
+    location /t {
+        content_by_lua_block {
+            local json = require("toolkit.json")
+            local t = require("lib.test_admin").test
+            local code, message, res = t('/apisix/admin/stream_routes',
+                 ngx.HTTP_POST,
+                [[{
+                    "remote_addr": "127.0.0.1",
+                    "upstream": {
+                        "nodes": {
+                            "127.0.0.1:8080": 1
+                        },
+                        "type": "roundrobin"
+                    }
+                }]]
+                )
+
+            if code >= 300 then
+                ngx.status = code
+                ngx.say(message)
+                return
+            end
+
+            res = json.decode(res)
+            -- clean data
+            local id = string.sub(res.node.key, #"/apisix/stream_routes/" + 1)
+            local code, message = t('/apisix/admin/stream_routes/' .. id,
+                 ngx.HTTP_DELETE
+                )
+
+            if code >= 300 then
+                ngx.status = code
+                ngx.say(message)
+                return
+            end
+
+            res.node.key = nil
+            res.node.value.create_time = nil
+            res.node.value.update_time = nil
+            ngx.say(json.encode(res))
+        }
+    }
+--- response_body
+{"action":"create","node":{"value":{"remote_addr":"127.0.0.1","upstream":{"hash_on":"vars","nodes":{"127.0.0.1:8080":1},"pass_host":"pass","scheme":"http","type":"roundrobin"}}}}
+--- request
+GET /t
+--- no_error_log
+[error]
+
+
+
+=== TEST 12: not unwanted data, PUT
+--- config
+    location /t {
+        content_by_lua_block {
+            local json = require("toolkit.json")
+            local t = require("lib.test_admin").test
+            local code, message, res = t('/apisix/admin/stream_routes/1',
+                 ngx.HTTP_PUT,
+                [[{
+                    "remote_addr": "127.0.0.1",
+                    "upstream": {
+                        "nodes": {
+                            "127.0.0.1:8080": 1
+                        },
+                        "type": "roundrobin"
+                    }
+                }]]
+                )
+
+            if code >= 300 then
+                ngx.status = code
+                ngx.say(message)
+                return
+            end
+
+            res = json.decode(res)
+            res.node.value.create_time = nil
+            res.node.value.update_time = nil
+            ngx.say(json.encode(res))
+        }
+    }
+--- response_body
+{"action":"set","node":{"key":"/apisix/stream_routes/1","value":{"id":"1","remote_addr":"127.0.0.1","upstream":{"hash_on":"vars","nodes":{"127.0.0.1:8080":1},"pass_host":"pass","scheme":"http","type":"roundrobin"}}}}
+--- request
+GET /t
+--- no_error_log
+[error]
+
+
+
+=== TEST 13: not unwanted data, GET
+--- config
+    location /t {
+        content_by_lua_block {
+            local json = require("toolkit.json")
+            local t = require("lib.test_admin").test
+            local code, message, res = t('/apisix/admin/stream_routes/1',
+                 ngx.HTTP_GET
+                )
+
+            if code >= 300 then
+                ngx.status = code
+                ngx.say(message)
+                return
+            end
+
+            res = json.decode(res)
+            assert(res.count ~= nil)
+            res.count = nil
+            ngx.say(json.encode(res))
+        }
+    }
+--- response_body
+{"action":"get","node":{"key":"/apisix/stream_routes/1","value":{"id":"1","remote_addr":"127.0.0.1","upstream":{"hash_on":"vars","nodes":{"127.0.0.1:8080":1},"pass_host":"pass","scheme":"http","type":"roundrobin"}}}}
+--- request
+GET /t
+--- no_error_log
+[error]
+
+
+
+=== TEST 14: not unwanted data, DELETE
+--- config
+    location /t {
+        content_by_lua_block {
+            local json = require("toolkit.json")
+            local t = require("lib.test_admin").test
+            local code, message, res = t('/apisix/admin/stream_routes/1',
+                 ngx.HTTP_DELETE
+                )
+
+            if code >= 300 then
+                ngx.status = code
+                ngx.say(message)
+                return
+            end
+
+            res = json.decode(res)
+            ngx.say(json.encode(res))
+        }
+    }
+--- response_body
+{"action":"delete","deleted":"1","key":"/apisix/stream_routes/1","node":{}}
+--- request
+GET /t
+--- no_error_log
+[error]

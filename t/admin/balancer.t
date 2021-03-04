@@ -26,19 +26,21 @@ add_block_preprocessor(sub {
     my $init_by_lua_block = <<_EOC_;
     require "resty.core"
     apisix = require("apisix")
+    core = require("apisix.core")
     apisix.http_init()
 
     function test(route, ctx, count)
         local balancer = require("apisix.balancer")
-        local router = require("apisix.router")
-        router.filter_test(route)
         local res = {}
         for i = 1, count or 12 do
-            local host, port, err = balancer.pick_server(route, ctx)
+            ctx.balancer_try_count = 0
+            local server, err = balancer.pick_server(route, ctx)
             if err then
                 ngx.say("failed: ", err)
             end
-            res[host] = (res[host] or 0) + 1
+
+            core.log.warn("host: ", server.host, " port: ", server.port)
+            res[server.host] = (res[server.host] or 0) + 1
         end
 
         local keys = {}
@@ -50,6 +52,8 @@ add_block_preprocessor(sub {
         for _, key in ipairs(keys) do
             ngx.say("host: ", key, " count: ", res[key])
         end
+
+        ctx.server_picker = nil
     end
 _EOC_
     $block->set_value("init_by_lua_block", $init_by_lua_block);
@@ -63,20 +67,18 @@ __DATA__
 --- config
     location /t {
         content_by_lua_block {
-            local route = {
-                    value = {
-                        upstream = {
-                            nodes = {
-                                ["39.97.63.215:80"] = 1,
-                                ["39.97.63.216:81"] = 1,
-                                ["39.97.63.217:82"] = 1,
-                            },
-                            type = "roundrobin",
-                        },
-                        id = 1
-                    }
+            local up_conf = {
+                type = "roundrobin",
+                nodes = {
+                    {host = "39.97.63.215", port = 80, weight = 1},
+                    {host = "39.97.63.216", port = 81, weight = 1},
+                    {host = "39.97.63.217", port = 82, weight = 1},
                 }
+            }
             local ctx = {conf_version = 1}
+            ctx.upstream_conf = up_conf
+            ctx.upstream_version = "ver"
+            ctx.upstream_key = up_conf.type .. "#route_" .. "id"
 
             test(route, ctx)
         }
@@ -96,23 +98,18 @@ host: 39.97.63.217 count: 4
 --- config
     location /t {
         content_by_lua_block {
-            local core = require("apisix.core")
-            local balancer = require("apisix.balancer")
-
-            local route = {
-                    value = {
-                        upstream = {
-                            nodes = {
-                                ["39.97.63.215:80"] = 1,
-                                ["39.97.63.216:81"] = 2,
-                                ["39.97.63.217:82"] = 3,
-                            },
-                            type = "roundrobin",
-                        },
-                        id = 1
-                    }
+            local up_conf = {
+                type = "roundrobin",
+                nodes = {
+                    {host = "39.97.63.215", port = 80, weight = 1},
+                    {host = "39.97.63.216", port = 81, weight = 2},
+                    {host = "39.97.63.217", port = 82, weight = 3},
                 }
+            }
             local ctx = {conf_version = 1}
+            ctx.upstream_conf = up_conf
+            ctx.upstream_version = "ver"
+            ctx.upstream_key = up_conf.type .. "#route_" .. "id"
 
             test(route, ctx)
         }
@@ -132,33 +129,30 @@ host: 39.97.63.217 count: 6
 --- config
     location /t {
         content_by_lua_block {
-            local balancer = require("apisix.balancer")
-
-            local route = {
-                    value = {
-                        upstream = {
-                            nodes = {
-                                ["39.97.63.215:80"] = 1,
-                                ["39.97.63.216:81"] = 1,
-                                ["39.97.63.217:82"] = 1,
-                            },
-                            type = "roundrobin",
-                        },
-                        id = 1
-                    }
+            local up_conf = {
+                type = "roundrobin",
+                nodes = {
+                    {host = "39.97.63.215", port = 80, weight = 1},
+                    {host = "39.97.63.216", port = 81, weight = 1},
+                    {host = "39.97.63.217", port = 82, weight = 1},
                 }
-            local ctx = {conf_version = 1}
+            }
+            local ctx = {}
+            ctx.upstream_conf = up_conf
+            ctx.upstream_version = 1
+            ctx.upstream_key = up_conf.type .. "#route_" .. "id"
 
             test(route, ctx)
 
             -- cached by version
-            route.value.upstream.nodes = {
-                ["39.97.63.218:83"] = 1,
+            up_conf.nodes = {
+                {host = "39.97.63.218", port = 80, weight = 1},
+                {host = "39.97.63.219", port = 80, weight = 0},
             }
             test(route, ctx)
 
             -- update, version changed
-            ctx = {conf_version = 2}
+            ctx.upstream_version = 2
             test(route, ctx)
         }
     }
@@ -181,37 +175,33 @@ host: 39.97.63.218 count: 12
 --- config
     location /t {
         content_by_lua_block {
-            local route = {
-                    value = {
-                        upstream = {
-                            nodes = {
-                                ["39.97.63.215:80"] = 1,
-                                ["39.97.63.216:81"] = 1,
-                                ["39.97.63.217:82"] = 1,
-                            },
-                            type = "chash",
-                            key  = "remote_addr",
-                        },
-                        id = 1
-                    }
-                }
-            local ctx = {
-                conf_version = 1,
-                var = {
-                    remote_addr = "127.0.0.1"
+            local up_conf = {
+                type = "chash",
+                key  = "remote_addr",
+                nodes = {
+                    {host = "39.97.63.215", port = 80, weight = 1},
+                    {host = "39.97.63.216", port = 81, weight = 1},
+                    {host = "39.97.63.217", port = 82, weight = 1},
                 }
             }
+            local ctx = {
+                var = {remote_addr = "127.0.0.1"},
+            }
+            ctx.upstream_conf = up_conf
+            ctx.upstream_version = 1
+            ctx.upstream_key = up_conf.type .. "#route_" .. "id"
 
             test(route, ctx)
 
             -- cached by version
-            route.value.upstream.nodes = {
-                ["39.97.63.218:83"] = 1,
+            up_conf.nodes = {
+                {host = "39.97.63.218", port = 80, weight = 1},
+                {host = "39.97.63.219", port = 80, weight = 0},
             }
             test(route, ctx)
 
             -- update, version changed
-            ctx.conf_version = 2
+            ctx.upstream_version = 2
             test(route, ctx)
         }
     }
@@ -220,6 +210,44 @@ GET /t
 --- response_body
 host: 39.97.63.215 count: 12
 host: 39.97.63.215 count: 12
+host: 39.97.63.218 count: 12
+--- no_error_log
+[error]
+
+
+
+=== TEST 5: return item directly if only have one item in `nodes`
+--- config
+    location /t {
+        content_by_lua_block {
+            local up_conf = {
+                type = "roundrobin",
+                nodes = {
+                    {host = "39.97.63.215", port = 80, weight = 1},
+                    {host = "39.97.63.216", port = 81, weight = 1},
+                    {host = "39.97.63.217", port = 82, weight = 1},
+                }
+            }
+            local ctx = {}
+            ctx.upstream_conf = up_conf
+            ctx.upstream_version = 1
+            ctx.upstream_key = up_conf.type .. "#route_" .. "id"
+
+            test(route, ctx)
+
+            -- one item in nodes, return it directly
+            up_conf.nodes = {
+                {host = "39.97.63.218", port = 80, weight = 1},
+            }
+            test(route, ctx)
+        }
+    }
+--- request
+GET /t
+--- response_body
+host: 39.97.63.215 count: 4
+host: 39.97.63.216 count: 4
+host: 39.97.63.217 count: 4
 host: 39.97.63.218 count: 12
 --- no_error_log
 [error]

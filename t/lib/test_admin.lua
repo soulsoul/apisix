@@ -14,9 +14,13 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 --
-local http = require("resty.http")
-local json = require("cjson.safe")
-local dir_names = {}
+local http              = require("resty.http")
+local json              = require("toolkit.json")
+local core              = require("apisix.core")
+local aes               = require "resty.aes"
+local ngx_encode_base64 = ngx.encode_base64
+local str_find          = core.string.find
+local dir_names         = {}
 
 
 local _M = {}
@@ -32,7 +36,7 @@ local function com_tab(pattern, data, deep)
             v = nil
         end
 
-        if type(v) == "table" then
+        if type(v) == "table" and data[k] then
             local ok, err = com_tab(v, data[k], deep + 1)
             if not ok then
                 return false, err
@@ -101,13 +105,21 @@ end
 
 
 function _M.comp_tab(left_tab, right_tab)
+    local err
     dir_names = {}
 
+    local _
     if type(left_tab) == "string" then
-        left_tab = json.decode(left_tab)
+        left_tab, _, err = json.decode(left_tab)
+        if not left_tab then
+            return false, "failed to decode expected data: " .. err
+        end
     end
     if type(right_tab) == "string" then
-        right_tab = json.decode(right_tab)
+        right_tab, _, err  = json.decode(right_tab)
+        if not right_tab then
+            return false, "failed to decode expected data: " .. err
+        end
     end
 
     local ok, err = com_tab(left_tab, right_tab)
@@ -119,7 +131,38 @@ function _M.comp_tab(left_tab, right_tab)
 end
 
 
-function _M.test(uri, method, body, pattern)
+local function set_yaml(fn, data)
+    local profile = os.getenv("APISIX_PROFILE")
+    if profile then
+        fn = fn .. "-" .. profile .. ".yaml"
+    else
+        fn = fn .. ".yaml"
+    end
+
+    local f = assert(io.open(os.getenv("TEST_NGINX_HTML_DIR") .. "/../conf/" .. fn, 'w'))
+    assert(f:write(data))
+    f:close()
+end
+
+
+function _M.set_config_yaml(data)
+    set_yaml("config", data)
+end
+
+
+function _M.set_apisix_yaml(data)
+    set_yaml("apisix", data)
+end
+
+
+function _M.test(uri, method, body, pattern, headers)
+    if not headers then
+        headers = {}
+    end
+    if not headers["Content-Type"] then
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    end
+
     if type(body) == "table" then
         body = json.encode(body)
     end
@@ -141,9 +184,7 @@ function _M.test(uri, method, body, pattern)
             method = method,
             body = body,
             keepalive = false,
-            headers = {
-            ["Content-Type"] = "application/x-www-form-urlencoded",
-            },
+            headers = headers,
         }
     )
     if not res then
@@ -202,6 +243,24 @@ function _M.req_self_with_http(uri, method, body, headers)
     )
 
     return res, err
+end
+
+
+function _M.aes_encrypt(origin)
+    local iv = "1234567890123456"
+    local aes_128_cbc_with_iv = assert(aes:new(iv, nil, aes.cipher(128, "cbc"), {iv=iv}))
+
+    if aes_128_cbc_with_iv ~= nil and str_find(origin, "---") then
+        local encrypted = aes_128_cbc_with_iv:encrypt(origin)
+        if encrypted == nil then
+            core.log.error("failed to encrypt key[", origin, "] ")
+            return origin
+        end
+
+        return ngx_encode_base64(encrypted)
+    end
+
+    return origin
 end
 
 

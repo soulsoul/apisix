@@ -34,7 +34,9 @@ local schema = {
     properties = {
         cache_zone = {
             type = "string",
-            minLength = 1
+            minLength = 1,
+            maxLength = 100,
+            default = "disk_cache_one",
         },
         cache_key = {
             type = "array",
@@ -91,7 +93,6 @@ local schema = {
             },
         },
     },
-    required = {"cache_zone"},
 }
 
 local _M = {
@@ -193,7 +194,7 @@ local function generate_cache_filename(cache_path, cache_levels, cache_key)
     local levels = ngx_re.split(cache_levels, ":")
     local filename = ""
 
-    local index = string.len(md5sum)
+    local index = #md5sum
     for k, v in pairs(levels) do
         local length = tonumber(v)
         index = index - length

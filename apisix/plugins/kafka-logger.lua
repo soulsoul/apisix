@@ -20,18 +20,26 @@ local producer = require ("resty.kafka.producer")
 local batch_processor = require("apisix.utils.batch-processor")
 local pairs    = pairs
 local type     = type
-local table    = table
 local ipairs   = ipairs
 local plugin_name = "kafka-logger"
-local stale_timer_running = false;
+local stale_timer_running = false
 local timer_at = ngx.timer.at
-local tostring = tostring
 local ngx = ngx
 local buffers = {}
+
+
+local lrucache = core.lrucache.new({
+    type = "plugin",
+})
 
 local schema = {
     type = "object",
     properties = {
+        meta_format = {
+            type = "string",
+            default = "default",
+            enum = {"default", "origin"},
+        },
         broker_list = {
             type = "object"
         },
@@ -44,8 +52,9 @@ local schema = {
         buffer_duration = {type = "integer", minimum = 1, default = 60},
         inactive_timeout = {type = "integer", minimum = 1, default = 5},
         batch_max_size = {type = "integer", minimum = 1, default = 1000},
+        include_req_body = {type = "boolean", default = false}
     },
-    required = {"broker_list", "kafka_topic", "key"}
+    required = {"broker_list", "kafka_topic"}
 }
 
 local _M = {
@@ -61,37 +70,18 @@ function _M.check_schema(conf)
 end
 
 
-local function send_kafka_data(conf, log_message)
-    if core.table.nkeys(conf.broker_list) == 0 then
-        core.log.error("failed to identify the broker specified")
+local function get_partition_id(sendbuffer, topic, log_message)
+    if not sendbuffer.topics[topic] then
+        core.log.info("current topic in sendbuffer has no message")
+        return nil
     end
-
-    local broker_list = {}
-    local broker_config = {}
-
-    for host, port  in pairs(conf.broker_list) do
-        if type(host) == 'string'
-            and type(port) == 'number' then
-
-            local broker = {
-                host = host, port = port
-            }
-            table.insert(broker_list,broker)
+    for i, message in pairs(sendbuffer.topics[topic]) do
+        if log_message == message.queue[2] then
+            return i
         end
     end
-
-    broker_config["request_timeout"] = conf.timeout * 1000
-
-    local prod, err = producer:new(broker_list,broker_config)
-    if err then
-        return nil, "failed to identify the broker specified: " .. err
-    end
-
-    local ok, err = prod:send(conf.kafka_topic, conf.key, log_message)
-    if not ok then
-        return nil, "failed to send data to Kafka topic" .. err
-    end
 end
+
 
 -- remove stale objects from the memory after timer expires
 local function remove_stale_objects(premature)
@@ -101,7 +91,8 @@ local function remove_stale_objects(premature)
 
     for key, batch in ipairs(buffers) do
         if #batch.entry_buffer.entries == 0 and #batch.batch_to_process == 0 then
-            core.log.debug("removing batch processor stale object, route id:", tostring(key))
+            core.log.warn("removing batch processor stale object, conf: ",
+                          core.json.delay_encode(key))
             buffers[key] = nil
         end
     end
@@ -110,15 +101,40 @@ local function remove_stale_objects(premature)
 end
 
 
-function _M.log(conf)
-    local entry = log_util.get_full_log(ngx)
+local function create_producer(broker_list, broker_config)
+    core.log.info("create new kafka producer instance")
+    return producer:new(broker_list, broker_config)
+end
 
-    if not entry.route_id then
-        core.log.error("failed to obtain the route id for kafka logger")
-        return
+
+local function send_kafka_data(conf, log_message, prod)
+    if core.table.nkeys(conf.broker_list) == 0 then
+        core.log.error("failed to identify the broker specified")
     end
 
-    local log_buffer = buffers[entry.route_id]
+    local ok, err = prod:send(conf.kafka_topic, conf.key, log_message)
+    core.log.info("partition_id: ",
+                  core.log.delay_exec(get_partition_id,
+                                      prod.sendbuffer, conf.kafka_topic, log_message))
+
+    if not ok then
+        return nil, "failed to send data to Kafka topic: " .. err
+    end
+
+    return true
+end
+
+
+function _M.log(conf, ctx)
+    local entry
+    if conf.meta_format == "origin" then
+        entry = log_util.get_req_original(ctx, conf)
+        -- core.log.info("origin entry: ", entry)
+
+    else
+        entry = log_util.get_full_log(ngx, conf)
+        core.log.info("full log entry: ", core.json.delay_encode(entry))
+    end
 
     if not stale_timer_running then
         -- run the timer every 30 mins if any log is present
@@ -126,16 +142,43 @@ function _M.log(conf)
         stale_timer_running = true
     end
 
+    local log_buffer = buffers[conf]
     if log_buffer then
         log_buffer:push(entry)
         return
+    end
+
+    -- reuse producer via lrucache to avoid unbalanced partitions of messages in kafka
+    local broker_list = core.table.new(core.table.nkeys(conf.broker_list), 0)
+    local broker_config = {}
+
+    for host, port in pairs(conf.broker_list) do
+        if type(host) == 'string'
+                and type(port) == 'number' then
+            local broker = {
+                host = host,
+                port = port
+            }
+            core.table.insert(broker_list, broker)
+        end
+    end
+
+    broker_config["request_timeout"] = conf.timeout * 1000
+
+    local prod, err = core.lrucache.plugin_ctx(lrucache, ctx, nil, create_producer,
+                                               broker_list, broker_config)
+    if err then
+        return nil, "failed to identify the broker specified: " .. err
     end
 
     -- Generate a function to be executed by the batch processor
     local func = function(entries, batch_max_size)
         local data, err
         if batch_max_size == 1 then
-            data, err = core.json.encode(entries[1]) -- encode as single {}
+            data = entries[1]
+            if type(data) ~= "string" then
+                data, err = core.json.encode(data) -- encode as single {}
+            end
         else
             data, err = core.json.encode(entries) -- encode as array [{}]
         end
@@ -144,7 +187,8 @@ function _M.log(conf)
             return false, 'error occurred while encoding the data: ' .. err
         end
 
-        return send_kafka_data(conf, data)
+        core.log.info("send data to kafka: ", data)
+        return send_kafka_data(conf, data, prod)
     end
 
     local config = {
@@ -164,8 +208,9 @@ function _M.log(conf)
         return
     end
 
-    buffers[entry.route_id] = log_buffer
+    buffers[conf] = log_buffer
     log_buffer:push(entry)
 end
+
 
 return _M

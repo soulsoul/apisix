@@ -18,10 +18,11 @@ local core = require("apisix.core")
 local get_routes = require("apisix.router").http_routes
 local schema_plugin = require("apisix.admin.plugins").check_schema
 local upstreams = require("apisix.admin.upstreams")
+local utils = require("apisix.admin.utils")
 local tostring = tostring
 local ipairs = ipairs
-local tonumber = tonumber
 local type = type
+local loadstring = loadstring
 
 
 local _M = {
@@ -47,6 +48,7 @@ local function check_conf(id, conf, need_id)
         return nil, {error_msg = "wrong service id"}
     end
 
+    conf.id = id
 
     core.log.info("schema: ", core.json.delay_encode(core.schema.service))
     core.log.info("conf  : ", core.json.delay_encode(conf))
@@ -55,7 +57,7 @@ local function check_conf(id, conf, need_id)
         return nil, {error_msg = "invalid configuration: " .. err}
     end
 
-    if need_id and not tonumber(id) then
+    if need_id and not id then
         return nil, {error_msg = "wrong type of service id"}
     end
 
@@ -91,6 +93,18 @@ local function check_conf(id, conf, need_id)
         end
     end
 
+    if conf.script then
+        local obj, err = loadstring(conf.script)
+        if not obj then
+            return nil, {error_msg = "failed to load 'script' string: "
+                                     .. err}
+        end
+
+        if type(obj()) ~= "table" then
+            return nil, {error_msg = "'script' should be a Lua object"}
+        end
+    end
+
     return need_id and id or true
 end
 
@@ -103,6 +117,12 @@ function _M.put(id, conf)
 
     local key = "/services/" .. id
     core.log.info("key: ", key)
+
+    local ok, err = utils.inject_conf_with_prev_conf("service", key, conf)
+    if not ok then
+        return 500, {error_msg = err}
+    end
+
     local res, err = core.etcd.set(key, conf)
     if not res then
         core.log.error("failed to put service[", key, "]: ", err)
@@ -119,7 +139,7 @@ function _M.get(id)
         key = key .. "/" .. id
     end
 
-    local res, err = core.etcd.get(key)
+    local res, err = core.etcd.get(key, not id)
     if not res then
         core.log.error("failed to get service[", key, "]: ", err)
         return 500, {error_msg = err}
@@ -136,6 +156,7 @@ function _M.post(id, conf)
     end
 
     local key = "/services"
+    utils.inject_timestamp(conf)
     local res, err = core.etcd.push(key, conf)
     if not res then
         core.log.error("failed to post service[", key, "]: ", err)
@@ -182,12 +203,14 @@ function _M.patch(id, conf, sub_path)
         return 400, {error_msg = "missing service id"}
     end
 
-    if not sub_path then
-        return 400, {error_msg = "missing sub-path"}
-    end
-
     if not conf then
         return 400, {error_msg = "missing new configuration"}
+    end
+
+    if not sub_path or sub_path == "" then
+        if type(conf) ~= "table"  then
+            return 400, {error_msg = "invalid configuration"}
+        end
     end
 
     local key = "/services" .. "/" .. id
@@ -203,42 +226,29 @@ function _M.patch(id, conf, sub_path)
     core.log.info("key: ", key, " old value: ",
                   core.json.delay_encode(res_old, true))
 
-    local new_value = res_old.body.node.value
-    local sub_value = new_value
-    local sub_paths = core.utils.split_uri(sub_path)
-    for i = 1, #sub_paths - 1 do
-        local sub_name = sub_paths[i]
-        if sub_value[sub_name] == nil then
-            sub_value[sub_name] = {}
+    local node_value = res_old.body.node.value
+    local modified_index = res_old.body.node.modifiedIndex
+
+    if sub_path and sub_path ~= "" then
+        local code, err, node_val = core.table.patch(node_value, sub_path, conf)
+        node_value = node_val
+        if code then
+            return code, err
         end
-
-        sub_value = sub_value[sub_name]
-
-        if type(sub_value) ~= "table" then
-            return 400, "invalid sub-path: /"
-                        .. core.table.concat(sub_paths, 1, i)
-        end
-    end
-
-    if type(sub_value) ~= "table" then
-        return 400, "invalid sub-path: /" .. sub_path
-    end
-
-    local sub_name = sub_paths[#sub_paths]
-    if sub_name and sub_name ~= "" then
-        sub_value[sub_name] = conf
     else
-        new_value = conf
+        node_value = core.table.merge(node_value, conf);
     end
-    core.log.info("new value ", core.json.delay_encode(new_value, true))
 
-    local id, err = check_conf(id, new_value, true)
+    utils.inject_timestamp(node_value, nil, conf)
+
+    core.log.info("new value ", core.json.delay_encode(node_value, true))
+
+    local id, err = check_conf(id, node_value, true)
     if not id then
         return 400, err
     end
 
-    -- TODO: this is not safe, we need to use compare-set
-    local res, err = core.etcd.set(key, new_value)
+    local res, err = core.etcd.atomic_set(key, node_value, nil, modified_index)
     if not res then
         core.log.error("failed to set new service[", key, "]: ", err)
         return 500, {error_msg = err}
